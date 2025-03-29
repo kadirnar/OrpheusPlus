@@ -1,0 +1,5 @@
+vllm==0.7.3
+setuptools>=42
+wheel
+flask
+snac
