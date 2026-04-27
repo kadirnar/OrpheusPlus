@@ -1,0 +1,21 @@
+# Model
+model_name: "Qwen/Qwen3-4B"
+tokenizer_name: "Qwen/Qwen3-4B"
+
+# Training Args
+epochs: 1
+batch_size: 16
+number_processes: 8
+pad_token: 151943
+save_steps: 12000
+learning_rate: 5.0e-5
+ratio: "2:1"
+
+# Datasets
+text_QA_dataset: "Vyvo/Emilia-EN-Snac-Qwen3-0.6B"
+TTS_dataset: "Vyvo/Emilia-EN-Snac-Qwen3-0.6B"
+
+# Naming and paths
+save_folder: "checkpoints"
+project_name: "qwen3-tts-transformers-v3"
+run_name: "qwen3-tts-transformers-v3"

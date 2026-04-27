@@ -1,0 +1,21 @@
+# Model
+model_name: "meta-llama/Llama-3.2-1B-Instruct"
+tokenizer_name: "meta-llama/Llama-3.2-1B-Instruct"
+
+# Training Args
+epochs: 1
+batch_size: 24
+number_processes: 8
+pad_token: 128263
+save_steps: 12000
+learning_rate: 5.0e-5
+ratio: "2:1"
+
+# Datasets
+text_QA_dataset: "Vyvo/Emilia-All-EN-Snac-LLama3.2"
+TTS_dataset: "Vyvo/Emilia-All-EN-Snac-LLama3.2"
+
+# Naming and paths
+save_folder: "checkpoints"
+project_name: "llama3-tts-v0"
+run_name: "llama3-tts-v0"
