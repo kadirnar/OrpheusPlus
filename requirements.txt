@@ -1,0 +1,37 @@
+# OrpheusPlus — Qwen3-4B + Mimi TTS training stack
+# Tested on Python 3.10, 8x B200 (CUDA 12.x).
+# pip install -r requirements.txt
+
+# --- Core deep-learning ---
+torch==2.11.0
+torchaudio==2.11.0
+triton==3.6.0
+
+# --- HuggingFace stack ---
+transformers==5.6.2
+accelerate==1.13.0
+datasets==4.8.4
+huggingface-hub==1.12.0
+safetensors==0.7.0
+tokenizers>=0.20
+
+# --- Kernels / fused ops (flash-attn3 pulled at runtime via `kernels`) ---
+liger-kernel==0.8.0
+kernels==0.14.1
+
+# --- Audio (Mimi encode pipeline) ---
+soundfile==0.13.1
+librosa==0.11.0
+
+# --- Data IO ---
+pyarrow==24.0.0
+numpy==2.2.6
+
+# --- Logging / config ---
+wandb==0.27.0
+PyYAML==6.0.3
+tqdm==4.67.3
+
+# --- Misc ---
+protobuf==7.34.1
+packaging==26.2

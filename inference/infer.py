@@ -1,79 +1,77 @@
-"""Reference-audio voice-cloning inference for OrpheusPlus.
+"""Single-GPU, multilingual voice-clone inference for OrpheusPlus (Qwen3 + Mimi 32cb).
 
-Matches the Orpheus prompt convention (canopyai/Orpheus-TTS, engine_class.py:82-84):
-    <custom_token_3>  text  <|eot|>  <custom_token_4>  <custom_token_5>  <custom_token_1>  [audio]
+Give a reference clip (+ its text) and a target text in ANY language; the model
+speaks the target text in the reference voice. Pure continuation cloning:
 
-Audio tokens are Mimi (8 codebooks * 2048) flattened per-frame interleaved.
-LM token id = code + AUDIO_OFFSET + codebook_idx * MIMI_CODEBOOK_SIZE + base_vocab.
+    prompt = [SOH] ref_text+target_text [eot] [EOH] [SOA] [SOS] <ref audio codes>
+    model continues -> <target audio codes> [EOS_speech]
 
-Run:
-    .venv/bin/python inference/infer.py \
-        --config configs/qwen3_config.yaml \
-        --ckpt ./checkpoints \
-        --ref-audio ref.wav --ref-text "Reference transcript" \
-        --text "Target text to synthesize" \
-        --out out.wav
+Edit CONFIG and JOBS below, then:  python infer.py   (no CLI args).
 """
-import argparse
-import math
-import sys
+import os
 
 import numpy as np
 import soundfile as sf
 import torch
 import torchaudio
-import yaml
 from transformers import (AutoFeatureExtractor, AutoModelForCausalLM,
                           AutoTokenizer, MimiModel)
 
-# --- Orpheus special-token offsets (relative to base LLM vocab). Do not change. ---
-START_OF_SPEECH = 1   # <custom_token_1>  — Orpheus SOS
-END_OF_SPEECH   = 2   # <custom_token_2>  — Orpheus EOS_speech (stop signal)
-START_OF_HUMAN  = 3   # <custom_token_3>
-END_OF_HUMAN    = 4   # <custom_token_4>
-START_OF_AI     = 5   # <custom_token_5>
+# --------------------------------------------------------------------------
+# Config (hardcoded - no CLI args)
+# --------------------------------------------------------------------------
+CKPT = "/home/microway/kadirnar/github/OrpheusPlus/checkpoints/checkpoint-171622"
+TOKENIZER_NAME = "Qwen/Qwen3-0.6B"
+MIMI_MODEL_ID = "kyutai/mimi"
+OUTPUT_DIR = "/home/microway/kadirnar/github/OrpheusPlus/infer_out"
+DEVICE = "cuda:0"
 
-# --- Mimi codec layout, must match pretrain/train.py:264 ---
-MIMI_NUM_CODEBOOKS = 8
+# Generation
+MAX_NEW_TOKENS = 9600
+MIN_NEW_TOKENS = 960            # floor avoids early EOS truncating the clip
+TEMPERATURE = 0.7
+TOP_P = 0.9
+REPETITION_PENALTY = 1.1
+MIN_OK_SECONDS = 1.5           # retry until at least this long (or MAX_RETRIES)
+MAX_RETRIES = 3
+
+# Mimi / Orpheus token layout - must match the training data (encode_mimi.py)
+MIMI_NUM_CODEBOOKS = 32
 MIMI_CODEBOOK_SIZE = 2048
-AUDIO_OFFSET       = 10   # 10 reserved special slots before audio tokens
-MIMI_MODEL_ID      = "kyutai/mimi"
+AUDIO_OFFSET = 10
+SOS, EOS_SPEECH, SOH, EOH, SOA = 1, 2, 3, 4, 5
+
+# --------------------------------------------------------------------------
+# Jobs: (out_name, ref_wav, ref_text, target_text). Any language works.
+# --------------------------------------------------------------------------
+REF_EN = "/home/microway/kadirnar/github/OrpheusPlus/andrew_00.wav"
+REF_EN_TEXT = "all sorts of things, but mainly just browsing FaceTime and streaming most of all."
+REF_JA = "/home/microway/kadirnar/github/OrpheusPlus/irodori-tts-v2-demo-2.wav"
+REF_JA_TEXT = "ごめん、少し遅れてしまった。終電電車がとても混んでいたんだ。へいでも、ちゃんと来られてよかった。"
+
+JOBS = [
+    ("en_1", REF_EN, REF_EN_TEXT, "Hello, this is a test of the text to speech model."),
+    ("en_2", REF_EN, REF_EN_TEXT, "Artificial intelligence is transforming the way we live and work."),
+    ("ja_1", REF_JA, REF_JA_TEXT, "こんにちは、これは音声合成モデルのテストです。"),
+    ("ja_2", REF_JA, REF_JA_TEXT, "桜の花が満開で、とても美しい春の一日でした。"),
+]
 
 
-def load_reference_codes(wav_path: str, mimi: MimiModel, fe, device: str) -> torch.Tensor:
-    """Encode a reference wav with Mimi → (1, 8, T_ref) integer codes."""
-    wav, sr = sf.read(wav_path, dtype="float32", always_2d=False)
-    if wav.ndim > 1:
-        wav = wav.mean(axis=1)
-    target_sr = fe.sampling_rate
-    if sr != target_sr:
-        wav_t = torch.from_numpy(wav).unsqueeze(0)
-        wav = torchaudio.functional.resample(wav_t, sr, target_sr).squeeze(0).numpy()
-    inputs = fe(raw_audio=wav, sampling_rate=target_sr, return_tensors="pt")
-    with torch.no_grad():
-        enc = mimi.encode(inputs["input_values"].to(device),
-                          num_quantizers=MIMI_NUM_CODEBOOKS)
-    return enc.audio_codes  # (1, 8, T_ref)
+def codes_to_lm_ids(codes, base):
+    """Mimi audio_codes (1, nq, T) -> flat per-frame interleaved LM token ids."""
+    c = codes[0].cpu()
+    flat = c.transpose(0, 1).reshape(-1)            # (T*nq,) frame-major
+    nq = c.shape[0]
+    return [int(v) + AUDIO_OFFSET + (i % nq) * MIMI_CODEBOOK_SIZE + base
+            for i, v in enumerate(flat.tolist())]
 
 
-def codes_to_lm_ids(codes: torch.Tensor, base_vocab: int) -> list[int]:
-    """(1, 8, T) Mimi codes → flat list of LM token ids, per-frame interleaved."""
-    c = codes[0].cpu()                     # (8, T)
-    n_q, T = c.shape
-    flat = c.transpose(0, 1).reshape(-1)   # (T*8,) = c0[0],c1[0],...,c7[0],c0[1],...
-    out = []
-    for i, code in enumerate(flat.tolist()):
-        cb = i % n_q
-        out.append(code + AUDIO_OFFSET + cb * MIMI_CODEBOOK_SIZE + base_vocab)
-    return out
-
-
-def lm_ids_to_codes(ids: list[int], base_vocab: int) -> torch.Tensor | None:
-    """Inverse of codes_to_lm_ids. Truncates to a multiple of 8; stops at first OOR."""
+def lm_ids_to_codes(ids, base):
+    """Generated LM token ids -> Mimi codes (1, nq, T); stop at first invalid."""
     valid = []
     for i, tid in enumerate(ids):
         cb = i % MIMI_NUM_CODEBOOKS
-        v = tid - base_vocab - AUDIO_OFFSET - cb * MIMI_CODEBOOK_SIZE
+        v = tid - base - AUDIO_OFFSET - cb * MIMI_CODEBOOK_SIZE
         if 0 <= v < MIMI_CODEBOOK_SIZE:
             valid.append(v)
         else:
@@ -82,113 +80,84 @@ def lm_ids_to_codes(ids: list[int], base_vocab: int) -> torch.Tensor | None:
     if T == 0:
         return None
     arr = torch.tensor(valid[: T * MIMI_NUM_CODEBOOKS], dtype=torch.long)
-    return arr.view(T, MIMI_NUM_CODEBOOKS).t().unsqueeze(0)  # (1, 8, T)
+    return arr.view(T, MIMI_NUM_CODEBOOKS).t().unsqueeze(0)
 
 
-def build_tokenizer(tokenizer_name: str):
-    """Load base tokenizer, capture base_vocab, add the same custom tokens as training."""
-    tok = AutoTokenizer.from_pretrained(tokenizer_name)
-    base_vocab = len(tok)
-    n_add = MIMI_NUM_CODEBOOKS * MIMI_CODEBOOK_SIZE + AUDIO_OFFSET
-    new_tokens = [f"<custom_token_{i}>" for i in range(0, n_add + 1)]
-    tok.add_tokens(new_tokens)
-    return tok, base_vocab
-
-
-def build_prompt(target_text: str, ref_text: str, ref_codes_lm: list[int],
-                 tokenizer, base_vocab: int) -> torch.Tensor:
-    """Orpheus prompt + reference audio appended after START_OF_SPEECH."""
-    text = (ref_text + " " + target_text).strip() if ref_text else target_text
-    text_ids = tokenizer(text, add_special_tokens=False).input_ids
-    eot = tokenizer.eos_token_id  # Llama: 128009; Qwen3: 151645/151643. Portable.
-    prompt = (
-        [base_vocab + START_OF_HUMAN]
-        + text_ids
-        + [eot,
-           base_vocab + END_OF_HUMAN,
-           base_vocab + START_OF_AI,
-           base_vocab + START_OF_SPEECH]
-        + ref_codes_lm
-    )
-    return torch.tensor([prompt], dtype=torch.long)
-
-
-def synthesize(args):
-    cfg = yaml.safe_load(open(args.config))
-    ckpt = args.ckpt or f"./{cfg['save_folder']}"
-    device = "cuda" if torch.cuda.is_available() else "cpu"
-
-    print(f"[load] tokenizer={cfg['tokenizer_name']}")
-    tokenizer, base_vocab = build_tokenizer(cfg["tokenizer_name"])
-    print(f"[load] base_vocab={base_vocab}; total_vocab={len(tokenizer)}")
-
-    print(f"[load] model={ckpt}")
-    model = AutoModelForCausalLM.from_pretrained(
-        ckpt, torch_dtype=torch.bfloat16
-    ).to(device).eval()
-    if model.get_input_embeddings().num_embeddings != len(tokenizer):
-        print(f"[warn] embedding size {model.get_input_embeddings().num_embeddings} "
-              f"!= tokenizer len {len(tokenizer)}. Token id alignment may be off.")
-
-    print(f"[load] mimi={MIMI_MODEL_ID}")
-    mimi = MimiModel.from_pretrained(MIMI_MODEL_ID).to(device).eval()
-    fe = AutoFeatureExtractor.from_pretrained(MIMI_MODEL_ID)
-
-    print(f"[encode] ref={args.ref_audio}")
-    ref_codes = load_reference_codes(args.ref_audio, mimi, fe, device)
-    print(f"[encode] ref_codes shape={tuple(ref_codes.shape)}")
-    ref_lm_ids = codes_to_lm_ids(ref_codes, base_vocab)
-
-    input_ids = build_prompt(
-        args.text, args.ref_text, ref_lm_ids, tokenizer, base_vocab
-    ).to(device)
-    print(f"[gen] prompt_len={input_ids.shape[1]} (text+ref_audio)")
-
-    eos_speech_id = base_vocab + END_OF_SPEECH
+def encode_ref(path, mimi, fe, device):
+    """Load + resample a reference wav and Mimi-encode it to audio_codes."""
+    wav, sr = sf.read(path, dtype="float32", always_2d=False)
+    if wav.ndim > 1:
+        wav = wav.mean(axis=1)
+    tsr = fe.sampling_rate
+    if sr != tsr:
+        wav = torchaudio.functional.resample(
+            torch.from_numpy(wav).unsqueeze(0), sr, tsr).squeeze(0).numpy()
+    inp = fe(raw_audio=wav, sampling_rate=tsr, return_tensors="pt")
     with torch.no_grad():
-        out = model.generate(
-            input_ids,
-            max_new_tokens=args.max_new_tokens,
-            do_sample=True,
-            temperature=args.temperature,
-            top_p=args.top_p,
-            repetition_penalty=args.repetition_penalty,
-            eos_token_id=eos_speech_id,
-            pad_token_id=cfg.get("pad_token", tokenizer.eos_token_id),
-        )
-    gen_ids = out[0, input_ids.shape[1]:].tolist()
-    print(f"[gen] generated {len(gen_ids)} tokens")
+        enc = mimi.encode(inp["input_values"].to(device),
+                          num_quantizers=MIMI_NUM_CODEBOOKS)
+    return enc.audio_codes
 
-    gen_codes = lm_ids_to_codes(gen_ids, base_vocab)
-    if gen_codes is None or gen_codes.shape[-1] == 0:
-        print("[err] no valid Mimi codes in generation", file=sys.stderr)
-        sys.exit(1)
-    print(f"[decode] gen_codes shape={tuple(gen_codes.shape)} "
-          f"({gen_codes.shape[-1]/12.5:.2f}s of audio)")
 
-    with torch.no_grad():
-        wav = mimi.decode(gen_codes.to(device)).audio_values  # (1, 1, S)
-    wav_np = wav.squeeze().cpu().to(torch.float32).numpy()
-    sf.write(args.out, wav_np, samplerate=fe.sampling_rate)
-    print(f"[done] wrote {args.out} ({wav_np.shape[0]/fe.sampling_rate:.2f}s)")
+def synth(target_text, ref_lm, model, tok, mimi, base, eos_id, device):
+    """Generate one cloned clip; retry for length, return (seconds, waveform)."""
+    tids = tok(target_text, add_special_tokens=False).input_ids
+    prompt = ([base + SOH] + tids
+              + [tok.eos_token_id, base + EOH, base + SOA, base + SOS] + ref_lm)
+    ii = torch.tensor([prompt], device=device)
+    attn = torch.ones_like(ii)                      # eot==pad would be masked otherwise
+
+    best = None
+    for _ in range(MAX_RETRIES):
+        with torch.no_grad():
+            out = model.generate(
+                ii, attention_mask=attn,
+                max_new_tokens=MAX_NEW_TOKENS, min_new_tokens=MIN_NEW_TOKENS,
+                do_sample=True, temperature=TEMPERATURE, top_p=TOP_P,
+                repetition_penalty=REPETITION_PENALTY,
+                eos_token_id=eos_id, pad_token_id=tok.eos_token_id)
+        codes = lm_ids_to_codes(out[0, ii.shape[1]:].tolist(), base)
+        if codes is None:
+            continue
+        with torch.no_grad():
+            wav = mimi.decode(codes.to(device)).audio_values
+        w = wav.squeeze().cpu().to(torch.float32).numpy()
+        dur = w.shape[0] / mimi.config.sampling_rate
+        if best is None or dur > best[0]:
+            best = (dur, w)
+        if dur >= MIN_OK_SECONDS:
+            break
+    return best
 
 
 def main():
-    p = argparse.ArgumentParser(description="OrpheusPlus reference-voice TTS inference")
-    p.add_argument("--config", required=True,
-                   help="path to qwen3_config.yaml or llama3_config.yaml")
-    p.add_argument("--ckpt", default=None,
-                   help="checkpoint dir (default: ./{save_folder} from config)")
-    p.add_argument("--ref-audio", required=True, help="reference audio wav path")
-    p.add_argument("--ref-text", default="", help="transcript of the reference clip")
-    p.add_argument("--text", required=True, help="target text to synthesize")
-    p.add_argument("--out", default="out.wav")
-    p.add_argument("--max-new-tokens", type=int, default=2400)
-    p.add_argument("--temperature", type=float, default=0.6)
-    p.add_argument("--top-p", type=float, default=0.9)
-    p.add_argument("--repetition-penalty", type=float, default=1.1)
-    args = p.parse_args()
-    synthesize(args)
+    os.makedirs(OUTPUT_DIR, exist_ok=True)
+    torch.cuda.set_device(DEVICE)
+
+    tok = AutoTokenizer.from_pretrained(TOKENIZER_NAME)
+    base = len(tok)                                 # base_vocab; audio ids start above
+    n_add = MIMI_NUM_CODEBOOKS * MIMI_CODEBOOK_SIZE + AUDIO_OFFSET
+    tok.add_tokens([f"<custom_token_{i}>" for i in range(0, n_add + 1)])
+    eos_id = base + EOS_SPEECH
+
+    model = AutoModelForCausalLM.from_pretrained(CKPT, dtype=torch.bfloat16).to(DEVICE).eval()
+    mimi = MimiModel.from_pretrained(MIMI_MODEL_ID).to(DEVICE).eval()
+    fe = AutoFeatureExtractor.from_pretrained(MIMI_MODEL_ID)
+
+    ref_cache = {}
+    for name, ref_wav, ref_text, target in JOBS:
+        if ref_wav not in ref_cache:
+            ref_cache[ref_wav] = codes_to_lm_ids(
+                encode_ref(ref_wav, mimi, fe, DEVICE), base)
+        # ref_text primes the voice; target_text is what we want spoken.
+        full = (ref_text + " " + target).strip()
+        res = synth(full, ref_cache[ref_wav], model, tok, mimi, base, eos_id, DEVICE)
+        if res is None:
+            print(f"{name}: FAILED (no valid audio)", flush=True)
+            continue
+        out_path = os.path.join(OUTPUT_DIR, name + ".wav")
+        sf.write(out_path, res[1], samplerate=mimi.config.sampling_rate)
+        print(f"{name}: {res[0]:.2f}s -> {out_path}", flush=True)
 
 
 if __name__ == "__main__":

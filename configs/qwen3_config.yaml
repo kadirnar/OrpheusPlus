@@ -1,21 +1,23 @@
 # Model
-model_name: "Qwen/Qwen3-4B"
-tokenizer_name: "Qwen/Qwen3-4B"
+model_name: "Qwen/Qwen3-0.6B"
+tokenizer_name: "Qwen/Qwen3-0.6B"
 
 # Training Args
 epochs: 1
-batch_size: 16
+batch_size: 8
 number_processes: 8
-pad_token: 151943
-save_steps: 12000
+pad_token: 151643          # Qwen3-4B <|endoftext|> (collator pad value)
+save_steps: 10000
 learning_rate: 5.0e-5
-ratio: "2:1"
+ratio: "1:0"               # TTS recipe: start 1:1 (50/50 text/speech), decay to 0:1 (pure TTS)
 
-# Datasets
-text_QA_dataset: "Vyvo/Emilia-EN-Snac-Qwen3-0.6B"
-TTS_dataset: "Vyvo/Emilia-EN-Snac-Qwen3-0.6B"
+# Datasets (local parquet, pre-tokenized to input_ids). Both shuffled in train.py.
+# text-QA: SynDataLab/DeepSeekFlash-3M-{en,ja} mixed (encode_textqa.py)
+# TTS    : ja-en-syn Mimi-encoded (encode_mimi.py)
+text_QA_dataset: "/scratch/kadirnar/textqa-qwen3/data"
+TTS_dataset: "/scratch/kadirnar/ja-en-syn-qwen3-mimi32/data"
 
 # Naming and paths
 save_folder: "checkpoints"
-project_name: "qwen3-tts-transformers-v3"
-run_name: "qwen3-tts-transformers-v3"
+project_name: "qwen3-ja-en-tts_ratio1to0"
+run_name: "qwen3-4b-ja-en-mimi"

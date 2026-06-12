@@ -1,3 +1,5 @@
+import os
+
 import torch
 from datasets import load_dataset
 from transformers import Trainer, TrainingArguments, AutoTokenizer
@@ -14,7 +16,9 @@ from accelerate import Accelerator
 import math
 from liger_kernel.transformers import AutoLigerKernelForCausalLM
 
-config_file = "/mnt/github/VyvoTTS/vyvotts/configs/llama3_config.yaml"
+config_file = os.path.join(
+    os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+    "configs", "qwen3_config.yaml")
 
 with open(config_file, "r") as file:
     config = yaml.safe_load(file)
@@ -36,10 +40,13 @@ pad_token = config["pad_token"]
 number_processes = config["number_processes"]
 learning_rate = config["learning_rate"]
 
-# Parse ratio from config (e.g., "2:1" -> 2)
+# Parse ratio schedule "<start>:<end>" of the text:speech multiplier.
+# Text batches per 1 speech batch, linearly decayed from start to end across
+# training. TTS-only recipe (Orpheus): "1:0" = start 50/50, end pure speech.
+# End-to-end speech recipe: "2:1" = start 2/3 text, end 50/50.
 ratio_str = config["ratio"]
 initial_ratio = int(ratio_str.split(":")[0])
-final_ratio = 1  # Target ratio is 1:1
+final_ratio = int(ratio_str.split(":")[1])
 
 
 class GradualRatioDataset(Dataset):
@@ -252,7 +259,7 @@ tokenizer = AutoTokenizer.from_pretrained(tokenizer_name)
 # Initialize model with proper dtype for Flash Attention 2.0 
 model = AutoLigerKernelForCausalLM.from_pretrained(
     model_name, 
-    attn_implementation="kernels-community/flash-attn3",
+    attn_implementation="kernels-community/flash-attn2",
     torch_dtype=torch.bfloat16,
 )
 
@@ -261,14 +268,22 @@ if accelerator.is_local_main_process:
     print(f"Pre-initializing model on {device} before FSDP")
 model = model.to(device)
 
-# Mimi codec: 8 codebooks (1 semantic + 7 acoustic) of 2048 entries + 10 specials.
-number_add_tokens = 8 * 2048 + 10
+# Mimi codec: 32 codebooks of 2048 entries + 10 specials.
+number_add_tokens = 32 * 2048 + 10
 new_tokens = [f"<custom_token_{i}>" for i in range(0, number_add_tokens + 1)]
 tokenizer.add_tokens(new_tokens)
 model.resize_token_embeddings(len(tokenizer))
 
-ds1 = load_dataset(dsn1, split="train")
-ds2 = load_dataset(dsn2, split="train")
+ds1 = load_dataset("parquet", data_files=os.path.join(dsn1, "*.parquet"),
+                   split="train")
+ds2 = load_dataset("parquet", data_files=os.path.join(dsn2, "*.parquet"),
+                   split="train")
+
+# Shards load in sorted (language-blocked) order and the sampler does NOT
+# shuffle, so without this the model would see all of one language then the
+# other and catastrophically forget the first. Shuffle to interleave EN/JA.
+ds1 = ds1.shuffle(seed=42)
+ds2 = ds2.shuffle(seed=43)
 
 batch_total = batch_size * number_processes
 
@@ -284,13 +299,11 @@ train_dataset = GradualRatioDataset(
 )
 
 training_args = TrainingArguments(
-    overwrite_output_dir=True,
     num_train_epochs=epochs,
     per_device_train_batch_size=batch_size,
     logging_steps=1,
     bf16=True,
     output_dir=f"./{base_repo_id}",
-    fsdp="auto_wrap",
     report_to="wandb",
     save_steps=save_steps,
     remove_unused_columns=True,
@@ -311,4 +324,5 @@ trainer = FSDPTrainer(
 print(f"Starting training with ratio progression: {initial_ratio}:1 -> {final_ratio}:1")
 print(f"Total steps: {total_steps}")
 
+# Always train from scratch (no resume).
 trainer.train()
